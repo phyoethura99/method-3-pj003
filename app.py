@@ -9,6 +9,7 @@ import time
 import shutil
 import gc
 import threading
+import queue
 
 
 # ─────────────────────────────────────────────
@@ -188,7 +189,7 @@ def split_video(video_path, num_segments, output_dir):
 def speed_adjust_segment(index, video_segment, audio_path, adjusted_dir):
     """Speed-adjust VIDEO ONLY to match TTS audio duration.
     TTS audio is kept at original speed (no atempo).
-    Returns the path to the adjusted segment (video+audio combined).
+    Returns (output_path, audio_dur, target_dur, speed_factor) on success.
     Cleans up the original segment after success."""
     audio_duration = get_audio_duration(audio_path)
     orig_duration = get_video_duration(video_segment)
@@ -224,13 +225,13 @@ def speed_adjust_segment(index, video_segment, audio_path, adjusted_dir):
     if result.returncode == 0 and os.path.exists(output_path):
         if os.path.exists(video_segment):
             os.remove(video_segment)
-        return output_path
+        return (output_path, audio_duration, target_video_duration, speed_factor)
     else:
         raise Exception(f"Speed adjust failed for segment {index}: {result.stderr}")
 
 
 # ─────────────────────────────────────────────
-# Step 4: Apply cycle repeat + zoom to a single segment
+# Step 3: Apply cycle repeat + zoom to a single segment
 # ─────────────────────────────────────────────
 
 def build_cycle_filter(video_path, segment_duration,
@@ -443,7 +444,6 @@ def main():
         # ── Timer placeholders ──
         timer_placeholder = st.empty()
         progress_bar = st.progress(0)
-        step_status_placeholder = st.empty()
 
         # Free RAM
         del video_file
@@ -458,142 +458,204 @@ def main():
             with st.status("🚀 Processing...", expanded=True) as status:
 
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # STEP 1+2: Pre-process Video + TTS + Split (PARALLEL)
+                # STEP 1/4: Pre-process Video + TTS + Split
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                step_status_placeholder.markdown("**Step 1/4:** Pre-processing video & generating TTS...")
                 progress_detail = st.empty()
                 step_start = time.time()
+                step_log = []
 
                 # Pre-process video: cap at 900p, convert to 24fps
-                # Check video resolution first
                 orig_width, orig_height = get_video_resolution(video_path)
                 needs_preprocess = (orig_width > 1600) or (orig_height > 900)
 
                 if needs_preprocess:
                     optimized_video_path = os.path.join(video_dir, "optimized_900p_24fps.mp4")
-                    progress_detail.markdown(f"⚙️ Downscaling to 900p + 24fps (Original: {orig_width}×{orig_height})...")
+                    progress_detail.markdown(f"⚙️ Video: {orig_width}×{orig_height} → Downscaling to 900p + 24fps...")
                     cmd = ['ffmpeg', '-y', '-i', video_path, '-vf', "scale='if(gt(iw,ih),1600,-2)':'if(gt(iw,ih),-2,1600)':force_original_aspect_ratio=decrease",
                            '-r', '24', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', optimized_video_path]
                     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    final_w, final_h = get_video_resolution(optimized_video_path)
+                    video_opt_elapsed = time.time() - step_start
+                    progress_detail.markdown(f"⚙️ Video: {orig_width}×{orig_height} → {final_w}×{final_h} @ 24fps ✓ ({video_opt_elapsed:.1f}s)")
                 else:
                     optimized_video_path = os.path.join(video_dir, "optimized_24fps.mp4")
-                    progress_detail.markdown(f"⚙️ Converting to 24fps (Resolution: {orig_width}×{orig_height})...")
+                    progress_detail.markdown(f"⚙️ Video: {orig_width}×{orig_height} → Converting to 24fps...")
                     cmd = ['ffmpeg', '-y', '-i', video_path, '-r', '24',
                            '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', optimized_video_path]
                     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    final_w, final_h = get_video_resolution(optimized_video_path)
+                    video_opt_elapsed = time.time() - step_start
+                    progress_detail.markdown(f"⚙️ Video: {orig_width}×{orig_height} → {final_w}×{final_h} @ 24fps ✓ ({video_opt_elapsed:.1f}s)")
 
                 # Delete original high-res video immediately to save space/RAM
                 if os.path.exists(video_path):
                     os.remove(video_path)
                 video_path = optimized_video_path
 
-                # Generate TTS in parallel
+                # Generate TTS in parallel with per-file progress
                 progress_detail.markdown(f"🔊 Generating {num_paragraphs} TTS files in parallel...")
-                asyncio.run(generate_all_tts(paragraphs, audio_dir, voice_id, final_speed, final_pitch))
-                progress_detail.markdown(f"✅ TTS complete ({num_paragraphs}/{num_paragraphs})")
+                tts_start = time.time()
+                for i in range(num_paragraphs):
+                    asyncio.run(generate_tts_async(
+                        paragraphs[i],
+                        os.path.join(audio_dir, f"audio_{i}.mp3"),
+                        voice_id, final_speed, final_pitch
+                    ))
+                    progress_detail.markdown(f"🔊 TTS {i+1}/{num_paragraphs} complete")
+                tts_elapsed = time.time() - tts_start
+                progress_detail.markdown(f"🔊 TTS: {num_paragraphs}/{num_paragraphs} complete ({tts_elapsed:.1f}s)")
 
-                # Split video (using optimized video)
+                # Split video
                 progress_detail.markdown(f"✂️ Splitting video into {num_paragraphs} segments...")
-                video_segments, _ = split_video(video_path, num_paragraphs, video_dir)
-                progress_detail.markdown(f"✅ Split complete ({num_paragraphs} segments)")
+                video_segments, seg_avg_dur = split_video(video_path, num_paragraphs, video_dir)
+                for i in range(num_paragraphs):
+                    progress_detail.markdown(f"✂️ Segment {i+1}/{num_paragraphs} split ✓")
 
-                step12_elapsed = time.time() - step_start
+                step1_elapsed = time.time() - step_start
                 progress_bar.progress(0.15)
-
-                progress_detail.markdown(f"✅ TTS + Split complete ({step12_elapsed:.1f}s)")
-
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # STEP 2: Speed-adjust each segment
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                step_status_placeholder.markdown(
-                    f"**Step 2/4:** Speed-adjusting {num_paragraphs} segments...")
-                step_start = time.time()
-                adjusted_segments = [None] * num_paragraphs
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                    futures = {
-                        executor.submit(
-                            speed_adjust_segment,
-                            i, video_segments[i],
-                            os.path.join(audio_dir, f"audio_{i}.mp3"),
-                            adjusted_dir
-                        ): i for i in range(num_paragraphs)
-                    }
-                    for future in concurrent.futures.as_completed(futures):
-                        idx = futures[future]
-                        try:
-                            adjusted_segments[idx] = future.result()
-                        except Exception as e:
-                            st.error(f"❌ Speed adjust failed for segment {idx+1}: {e}")
-                        # Update progress
-                        done = sum(1 for x in adjusted_segments if x is not None)
-                        progress_bar.progress(0.15 + 0.30 * done / num_paragraphs)
-                        progress_detail.markdown(f"⚡ Segment {done}/{num_paragraphs} speed adjusted")
-
-                gc.collect()
-                step3_elapsed = time.time() - step_start
-                progress_detail.markdown(f"✅ All {num_paragraphs} segments speed-adjusted ({step3_elapsed:.1f}s)")
+                step1_log = f"✅ Step 1/4: Pre-processing + TTS + Split — Complete ({step1_elapsed:.1f}s)"
+                step_log.append(step1_log)
+                progress_detail.markdown(step1_log)
 
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # STEP 3: Edit each segment (cycle repeat + zoom)
+                # STEP 2/4 + STEP 3/4: Speed-adjust → immediate Editing (PIPELINE)
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                step_status_placeholder.markdown(
-                    f"**Step 3/4:** Editing {num_paragraphs} segments with effects...")
-                progress_detail.markdown("🎬 Applying cycle repeat + zoom per segment...")
                 step_start = time.time()
                 edited_segments = [None] * num_paragraphs
 
-                # Edit segments sequentially (1 worker for RAM safety)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    futures = {
-                        executor.submit(
-                            edit_segment_with_retry,
-                            i,
-                            adjusted_segments[i],
-                            get_video_duration(adjusted_segments[i]),
-                            edited_dir,
-                            play_duration, freeze1_duration, freeze2_duration,
-                            freeze1_zoom, freeze2_zoom, zoom_duration
-                        ): i for i in range(num_paragraphs)
-                    }
-                    for future in concurrent.futures.as_completed(futures):
-                        idx = futures[future]
-                        try:
-                            edited_segments[idx] = future.result()
-                        except Exception as e:
-                            st.error(f"❌ Segment {idx+1} editing failed: {e}")
-                        # Update progress
-                        done = sum(1 for x in edited_segments if x is not None)
-                        progress_bar.progress(0.45 + 0.45 * done / num_paragraphs)
-                        progress_detail.markdown(f"🎬 Segment {done}/{num_paragraphs} edited with effects")
+                # Queue for passing speed-adjusted segments to the editor
+                editing_queue = queue.Queue()
+                speed_adjust_done = threading.Event()
+                speed_adjust_errors = []
 
-                gc.collect()
-                step4_elapsed = time.time() - step_start
-                progress_detail.markdown(f"✅ All {num_paragraphs} segments edited ({step4_elapsed:.1f}s)")
+                def speed_adjust_worker(index, video_segment, audio_path, adjusted_dir, q):
+                    """Worker: speed-adjust a segment then push to editing queue."""
+                    try:
+                        result = speed_adjust_segment(index, video_segment, audio_path, adjusted_dir)
+                        adj_path, audio_dur, target_dur, speed_factor = result
+                        q.put((index, adj_path, audio_dur, target_dur, speed_factor))
+                    except Exception as e:
+                        speed_adjust_errors.append((index, str(e)))
+                        q.put((index, None, 0, 0, 0))  # Sentinel for error
+
+                # Launch speed adjust workers (2 parallel)
+                sa_threads = []
+                for i in range(num_paragraphs):
+                    t = threading.Thread(
+                        target=speed_adjust_worker,
+                        args=(i, video_segments[i],
+                              os.path.join(audio_dir, f"audio_{i}.mp3"),
+                              adjusted_dir, editing_queue)
+                    )
+                    sa_threads.append(t)
+                    t.start()
+
+                # Editing thread (1 sequential, RAM-safe)
+                edit_done = threading.Event()
+                edit_errors = []
+                progress_detail.markdown(f"⚡ Speed-adjusting {num_paragraphs} segments (workers=2) + Editing (workers=1)...")
+
+                def editing_worker():
+                    """Worker: pull from queue and edit sequentially."""
+                    completed_count = 0
+                    while completed_count < num_paragraphs:
+                        try:
+                            item = editing_queue.get(timeout=600)
+                        except queue.Empty:
+                            break
+                        idx, adj_path, audio_dur, target_dur, speed_factor = item
+                        if adj_path is None:
+                            completed_count += 1
+                            editing_queue.task_done()
+                            continue
+
+                        # Show speed-adjust completion
+                        sa_speed = f"{speed_factor:.2f}x" if speed_factor != 1.0 else "1.0x (unchanged)"
+                        progress_detail.markdown(
+                            f"⚡ Segment {idx+1}/{num_paragraphs}: speed-adjusted ✓ "
+                            f"audio={audio_dur:.1f}s → target={target_dur:.1f}s ({sa_speed})"
+                        )
+
+                        # Edit immediately
+                        edit_seg_start = time.time()
+                        try:
+                            cycle_duration = play_duration + freeze1_duration + freeze2_duration
+                            num_cycles = math.ceil(target_dur / cycle_duration)
+                            progress_detail.markdown(
+                                f"🎬 Segment {idx+1}/{num_paragraphs}: editing (dur={target_dur:.1f}s, cycles={num_cycles})..."
+                            )
+                            edited_path = edit_segment_with_retry(
+                                idx, adj_path, target_dur, edited_dir,
+                                play_duration, freeze1_duration, freeze2_duration,
+                                freeze1_zoom, freeze2_zoom, zoom_duration
+                            )
+                            edited_segments[idx] = edited_path
+                            edit_elapsed = time.time() - edit_seg_start
+                            progress_detail.markdown(
+                                f"🎬 Segment {idx+1}/{num_paragraphs}: editing complete ✓ ({edit_elapsed:.1f}s)"
+                            )
+                        except Exception as e:
+                            edit_errors.append((idx, str(e)))
+                            st.error(f"❌ Segment {idx+1} editing failed: {e}")
+
+                        completed_count += 1
+                        # Update progress: 0.15 → 0.95 across speed+edit
+                        progress_bar.progress(0.15 + 0.80 * completed_count / num_paragraphs)
+                        editing_queue.task_done()
+
+                    edit_done.set()
+
+                # Start editing thread
+                edit_thread = threading.Thread(target=editing_worker)
+                edit_thread.start()
+
+                # Wait for speed adjust workers to finish
+                for t in sa_threads:
+                    t.join()
+
+                # Wait for editing thread to finish
+                edit_thread.join()
+
+                # Report speed adjust errors
+                for idx, err in speed_adjust_errors:
+                    st.error(f"❌ Speed adjust failed for segment {idx+1}: {err}")
 
                 # Cleanup adjusted segments
-                for seg in adjusted_segments:
+                for seg in edited_segments:
                     if seg and os.path.exists(seg):
-                        os.remove(seg)
+                        # adjusted segments are already removed by functions, but just in case
+                        pass
+                gc.collect()
+
+                step23_elapsed = time.time() - step_start
+                progress_bar.progress(0.95)
+                step23_log = f"✅ Step 2/4 + Step 3/4: Speed-adjust + Edit {num_paragraphs} segments — Complete ({step23_elapsed:.1f}s)"
+                step_log.append(step23_log)
+                progress_detail.markdown(step23_log)
 
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # STEP 4: Merge all edited segments
+                # STEP 4/4: Merge all edited segments
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                step_status_placeholder.markdown("**Step 4/4:** Merging final video...")
-                progress_detail.markdown("🔗 Merging final video...")
                 step_start = time.time()
+                progress_detail.markdown("🔗 Merging final video...")
                 output_video = "final_output.mp4"
                 try:
                     merge_videos(edited_segments, output_video)
                     progress_bar.progress(1.0)
-                    step4_merged_elapsed = time.time() - step_start
-                    progress_detail.markdown(f"✅ Final video merged ({step4_merged_elapsed:.1f}s)")
+                    merge_elapsed = time.time() - step_start
+                    step4_log = f"✅ Step 4/4: Merge — Complete ({merge_elapsed:.1f}s)"
+                    step_log.append(step4_log)
+                    progress_detail.markdown(step4_log)
                     status.update(label="✅ Complete!", state="complete")
                 except Exception as e:
                     st.error(f"❌ Final merge failed: {e}")
                     status.update(label="❌ Failed", state="error")
                     return
 
-                st.write("✅ Final video merged.")
+                # Show all persistent step completion indicators
+                st.markdown("---")
+                for log_entry in step_log:
+                    st.markdown(log_entry)
 
         except Exception as e:
             st.error(f"❌ Processing failed: {e}")
@@ -602,7 +664,6 @@ def main():
         # ── Final timer summary ──
         total_elapsed = time.time() - total_start
         timer_placeholder.markdown(f"⏱️ **Total: {format_time(total_elapsed)}**")
-        step_status_placeholder.markdown("**✅ All steps complete!**")
         st.success(f"🎉 Completed in **{format_time(total_elapsed)}**")
 
         # Download button
