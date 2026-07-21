@@ -394,9 +394,40 @@ def main():
         with col2:
             selected_emotion = st.selectbox("Emotion", options=[e["name"] for e in EMOTIONS])
             emotion_data = next(e for e in EMOTIONS if e["name"] == selected_emotion)
-        final_speed, final_pitch = (style_data["speed"] + emotion_data["s"],
-                                    style_data["pitch"] + emotion_data["p"])
-        st.caption(f"📊 Speed: {final_speed}%, Pitch: {final_pitch}Hz")
+        base_speed = style_data["speed"] + emotion_data["s"]
+        base_pitch = style_data["pitch"] + emotion_data["p"]
+        st.caption(f"📊 Base Speed: {base_speed}%, Base Pitch: {base_pitch}Hz")
+
+        # Custom Speed slider with ±5 step buttons
+        st.markdown("**🔊 Custom Speed Override**")
+        col_sp1, col_sp2, col_sp3 = st.columns([1, 4, 1])
+        with col_sp1:
+            if st.button("➖", key="speed_down"):
+                st.session_state.custom_speed = max(-100, st.session_state.get("custom_speed", 0) - 5)
+        with col_sp2:
+            custom_speed = st.slider("Speed (%)", -100, 100, st.session_state.get("custom_speed", 0), key="custom_speed_slider")
+            st.session_state.custom_speed = custom_speed
+        with col_sp3:
+            if st.button("➕", key="speed_up"):
+                st.session_state.custom_speed = min(100, st.session_state.get("custom_speed", 0) + 5)
+
+        # Custom Pitch slider with ±5 step buttons
+        st.markdown("**🎵 Custom Pitch Override**")
+        col_pt1, col_pt2, col_pt3 = st.columns([1, 4, 1])
+        with col_pt1:
+            if st.button("➖", key="pitch_down"):
+                st.session_state.custom_pitch = max(-100, st.session_state.get("custom_pitch", 0) - 5)
+        with col_pt2:
+            custom_pitch = st.slider("Pitch (Hz)", -100, 100, st.session_state.get("custom_pitch", 0), key="custom_pitch_slider")
+            st.session_state.custom_pitch = custom_pitch
+        with col_pt3:
+            if st.button("➕", key="pitch_up"):
+                st.session_state.custom_pitch = min(100, st.session_state.get("custom_pitch", 0) + 5)
+
+        final_speed = base_speed + custom_speed
+        final_pitch = base_pitch + custom_pitch
+        st.caption(f"✅ Final Speed: {final_speed}%, Final Pitch: {final_pitch}Hz")
+
         st.markdown("---")
         play_duration = st.slider("▶️ Play Duration (s)", 1, 5, 3)
         col3, col4 = st.columns(2)
